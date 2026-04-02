@@ -1,49 +1,111 @@
+import base64
 import json
 import os
+import random
 import re
-import time
+import string
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import certifi
 import requests
 import urllib3
-from requests.exceptions import HTTPError, RequestException, SSLError
+from requests.exceptions import RequestException, SSLError
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://clube.uol.com.br"
 LIST_URL = f"{BASE_URL}/?order=new"
-FALLBACK_LIST_URL = f"{BASE_URL}/"
 
+REPO_OWNER = os.environ.get("REPO_OWNER", "leosaquetto")
+REPO_NAME = os.environ.get("REPO_NAME", "uol-bot")
+TARGET_BRANCH = os.environ.get("TARGET_BRANCH", "main")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+
+STATUS_RUNTIME_FILE = "status_runtime.json"
+SEEN_CACHE_FILE = "railway_seen_links.json"
+
+MAX_DETAIL_FETCHES = int(os.environ.get("MAX_DETAIL_FETCHES", "4"))
+MAX_SEEN_LINKS = int(os.environ.get("MAX_SEEN_LINKS", "300"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
-TEST_DETAIL_FETCH = os.environ.get("TEST_DETAIL_FETCH", "1").strip() == "1"
-MAX_DETAIL_TESTS = int(os.environ.get("MAX_DETAIL_TESTS", "1"))
 
 USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def log(msg: str) -> None:
     print(msg, flush=True)
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def github_api_url(path: str) -> str:
+    return f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
+
+def build_headers_json() -> Dict[str, str]:
+    return {
+        "User-Agent": "uol-railway-collector",
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+def base64_encode(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
+def base64_decode(text: str) -> Optional[str]:
+    try:
+        return base64.b64decode(str(text).replace("\n", "")).decode("utf-8")
+    except Exception:
+        return None
+
+def github_get_file(path: str) -> Dict[str, Any]:
+    try:
+        resp = requests.get(github_api_url(path), headers=build_headers_json(), timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 404:
+            return {"ok": True, "exists": False, "content": None, "sha": None}
+        data = resp.json()
+        if not resp.ok:
+            return {"ok": False, "error": f"github get {resp.status_code}: {data}"}
+        raw = base64_decode(data.get("content", ""))
+        return {"ok": True, "exists": True, "content": raw, "sha": data.get("sha")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def github_put_file(path: str, content: str, message: str) -> Dict[str, Any]:
+    current = github_get_file(path)
+    if not current["ok"]:
+        return {"ok": False, "error": f"falha leitura prévia {path}: {current['error']}"}
+
+    body = {"message": message, "content": base64_encode(content), "branch": TARGET_BRANCH}
+    if current.get("sha"):
+        body["sha"] = current["sha"]
+
+    try:
+        resp = requests.put(github_api_url(path), headers=build_headers_json(), json=body, timeout=REQUEST_TIMEOUT)
+        data = resp.json()
+        if resp.ok and data.get("commit"):
+            return {"ok": True, "data": data}
+        return {"ok": False, "error": f"github put {resp.status_code}: {data}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def clean_text(text: Optional[str]) -> str:
     if not text:
         return ""
     text = str(text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    text = re.sub(r"^ +| +$", "", text, flags=re.MULTILINE)
+    text = (
+        text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
-
 
 def html_to_text(html: str) -> str:
     if not html:
@@ -55,8 +117,9 @@ def html_to_text(html: str) -> str:
     text = re.sub(r"<li[^>]*>", "\n• ", text, flags=re.I)
     text = re.sub(r"</li>", "", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    return clean_text(text)
-
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
 
 def absolutize_url(url: Optional[str]) -> str:
     if not url:
@@ -70,400 +133,101 @@ def absolutize_url(url: Optional[str]) -> str:
         return BASE_URL + url
     return f"{BASE_URL}/{url}"
 
+def normalize_link(url: str) -> str:
+    return str(url or "").strip()
 
-def get_offer_id(link: str) -> str:
-    try:
-        clean_link = str(link).split("?")[0].rstrip("/")
-        return clean_link.split("/")[-1]
-    except Exception:
-        return str(link or "").strip()
+def pad(n: int) -> str:
+    return str(n).zfill(2)
 
+def build_snapshot_id() -> str:
+    d = datetime.now()
+    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+    return f"{d.year}{pad(d.month)}{pad(d.day)}_{pad(d.hour)}{pad(d.minute)}{pad(d.second)}_{rand}"
 
-def normalize_offer_key(value: str) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if raw.startswith("http://") or raw.startswith("https://"):
-        raw = get_offer_id(raw)
-    raw = re.sub(r"https?://", "", raw)
-    raw = re.sub(r"[^a-z0-9]+", "-", raw)
-    raw = re.sub(r"-{2,}", "-", raw)
-    return raw.strip("-")
-
-
-def uniq_by(items: List[Dict[str, Any]], key_fn) -> List[Dict[str, Any]]:
-    out = []
-    seen = set()
-    for item in items:
-        key = key_fn(item)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
-
-
-def is_bad_banner_url(url: Optional[str]) -> bool:
-    u = str(url or "").lower()
-    if not u:
-        return True
-    return (
-        "loader.gif" in u
-        or "/static/images/loader.gif" in u
-        or "/parceiros/" in u
-        or "/rodape/" in u
-        or "icon-instagram" in u
-        or "icon-facebook" in u
-        or "icon-twitter" in u
-        or "icon-youtube" in u
-        or "instagram.png" in u
-        or "facebook.png" in u
-        or "twitter.png" in u
-        or "youtube.png" in u
-        or "share-" in u
-        or "social" in u
-        or "logo-uol" in u
-        or "logo_uol" in u
-    )
-
-
-def is_likely_benefit_banner(url: Optional[str]) -> bool:
-    u = str(url or "").lower()
-    if not u or is_bad_banner_url(u):
-        return False
-    return (
-        "/beneficios/" in u
-        or "/campanhasdeingresso/" in u
-        or "cloudfront.net" in u
-    )
-
-
-def build_headers(referer: Optional[str] = None) -> Dict[str, str]:
-    return {
+def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
+    headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": referer or (BASE_URL + "/"),
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+        "Referer": referer,
         "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
     }
-
-
-def fetch_once(session: requests.Session, url: str, referer: Optional[str], verify_value) -> requests.Response:
-    return session.get(
-        url,
-        headers=build_headers(referer),
-        timeout=REQUEST_TIMEOUT,
-        verify=verify_value,
-        allow_redirects=True,
-    )
-
-
-def fetch_with_fallback(session: requests.Session, url: str, referer: Optional[str] = None) -> Dict[str, Any]:
-    started = time.perf_counter()
 
     try:
-        r = fetch_once(session, url, referer, certifi.where())
-        elapsed = round(time.perf_counter() - started, 3)
-        return {
-            "ok": r.ok,
-            "status_code": r.status_code,
-            "text": r.text if r.ok else "",
-            "elapsed_s": elapsed,
-            "url": url,
-            "error": "" if r.ok else f"http {r.status_code}",
-            "used_insecure_fallback": False,
-        }
-    except SSLError as e:
-        try:
-            r = fetch_once(session, url, referer, False)
-            elapsed = round(time.perf_counter() - started, 3)
-            return {
-                "ok": r.ok,
-                "status_code": r.status_code,
-                "text": r.text if r.ok else "",
-                "elapsed_s": elapsed,
-                "url": url,
-                "error": "" if r.ok else f"http {r.status_code}",
-                "used_insecure_fallback": True,
-            }
-        except HTTPError as http_e:
-            elapsed = round(time.perf_counter() - started, 3)
-            status_code = getattr(http_e.response, "status_code", None)
-            return {
-                "ok": False,
-                "status_code": status_code,
-                "text": "",
-                "elapsed_s": elapsed,
-                "url": url,
-                "error": f"ssl fallback http {status_code}",
-                "used_insecure_fallback": True,
-            }
-        except RequestException as req_e:
-            elapsed = round(time.perf_counter() - started, 3)
-            return {
-                "ok": False,
-                "status_code": None,
-                "text": "",
-                "elapsed_s": elapsed,
-                "url": url,
-                "error": f"ssl fallback fail: {req_e}",
-                "used_insecure_fallback": True,
-            }
-    except HTTPError as e:
-        elapsed = round(time.perf_counter() - started, 3)
-        status_code = getattr(e.response, "status_code", None)
-        return {
-            "ok": False,
-            "status_code": status_code,
-            "text": "",
-            "elapsed_s": elapsed,
-            "url": url,
-            "error": f"http {status_code}",
-            "used_insecure_fallback": False,
-        }
-    except RequestException as e:
-        elapsed = round(time.perf_counter() - started, 3)
-        return {
-            "ok": False,
-            "status_code": None,
-            "text": "",
-            "elapsed_s": elapsed,
-            "url": url,
-            "error": str(e),
-            "used_insecure_fallback": False,
-        }
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=certifi.where(), allow_redirects=True)
+        resp.raise_for_status()
+        return resp.text
+    except SSLError:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False, allow_redirects=True)
+        resp.raise_for_status()
+        return resp.text
 
-
-def get_html(url: str) -> Dict[str, Any]:
-    session = requests.Session()
-    candidates = [(url, BASE_URL + "/")]
-    if url == LIST_URL:
-        candidates.append((FALLBACK_LIST_URL, BASE_URL + "/"))
-
-    last_result = None
-    for candidate_url, referer in candidates:
-        result = fetch_with_fallback(session, candidate_url, referer)
-        last_result = result
-        if result["ok"] and result["text"]:
-            return result
-
-    return last_result or {
-        "ok": False,
-        "status_code": None,
-        "text": "",
-        "elapsed_s": 0,
-        "url": url,
-        "error": "sem resposta",
-        "used_insecure_fallback": False,
-    }
-
-
-def extract_all_img_meta_from_block_html(block_html: str) -> List[Dict[str, Any]]:
-    imgs: List[Dict[str, Any]] = []
-    for m in re.finditer(r"<img([^>]+)>", block_html, re.I):
-        attrs = m.group(1) or ""
-        src_match = (
-            re.search(r'data-src=["\']([^"\']+)["\']', attrs, re.I)
-            or re.search(r'data-original=["\']([^"\']+)["\']', attrs, re.I)
-            or re.search(r'data-lazy=["\']([^"\']+)["\']', attrs, re.I)
-            or re.search(r'src=["\']([^"\']+)["\']', attrs, re.I)
-        )
-        if not src_match:
-            continue
-        src = absolutize_url(src_match.group(1))
-        if not src or src.startswith("data:image"):
-            continue
-
-        class_match = re.search(r'class=["\']([^"\']+)["\']', attrs, re.I)
-        title_match = re.search(r'title=["\']([^"\']+)["\']', attrs, re.I)
-        alt_match = re.search(r'alt=["\']([^"\']+)["\']', attrs, re.I)
-        width_match = re.search(r'width=["\']([^"\']+)["\']', attrs, re.I)
-        height_match = re.search(r'height=["\']([^"\']+)["\']', attrs, re.I)
-
-        try:
-            width = int(width_match.group(1)) if width_match else 0
-        except Exception:
-            width = 0
-
-        try:
-            height = int(height_match.group(1)) if height_match else 0
-        except Exception:
-            height = 0
-
-        class_names = (class_match.group(1) if class_match else "").lower()
-        title = (title_match.group(1) if title_match else "").strip().lower()
-        alt = (alt_match.group(1) if alt_match else "").strip().lower()
-
-        imgs.append(
-            {
-                "src": src,
-                "title": title,
-                "alt": alt,
-                "class_name": class_names,
-                "width": width,
-                "height": height,
-                "is_partner_path": "/parceiros/" in src,
-                "is_partner_like": (
-                    "/parceiros/" in src
-                    or "logo" in class_names
-                    or "brand" in class_names
-                    or "parceiro" in class_names
-                    or "logo" in alt
-                    or bool(title)
-                    or (0 < width <= 220)
-                    or (0 < height <= 120)
-                ),
-            }
-        )
-
-    return uniq_by(imgs, lambda x: x["src"])
-
-
-def choose_images_from_block_html(block_html: str) -> Dict[str, str]:
-    all_imgs = extract_all_img_meta_from_block_html(block_html)
-    partner_img_url = ""
-    img_url = ""
-
-    partner_candidates = [img for img in all_imgs if img["is_partner_like"] or img["is_partner_path"]]
-    if partner_candidates:
-        partner_img_url = partner_candidates[0]["src"]
-
-    banner_candidates = [
-        img for img in all_imgs
-        if (not partner_img_url or img["src"] != partner_img_url) and is_likely_benefit_banner(img["src"])
-    ]
-    if banner_candidates:
-        img_url = banner_candidates[-1]["src"]
-
-    if not img_url:
-        fallback_candidates = [
-            img for img in all_imgs
-            if (not partner_img_url or img["src"] != partner_img_url) and not is_bad_banner_url(img["src"])
-        ]
-        if fallback_candidates:
-            img_url = fallback_candidates[-1]["src"]
-
-    if not partner_img_url and len(all_imgs) >= 2:
-        for img in all_imgs:
-            if img["src"] != img_url:
-                partner_img_url = img["src"]
-                break
-
-    return {"img_url": img_url, "partner_img_url": partner_img_url}
-
-
-def parse_offers_like_latest_flow(html: str) -> List[Dict[str, Any]]:
+def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
     cards = []
-    card_regex = re.compile(
-        r'<div class="col-12 col-sm-4 col-md-3 mb-3 beneficio"[\s\S]*?<!-- Fim div beneficio -->',
-        re.I,
-    )
+    card_regex = re.compile(r'<div class="col-12 col-sm-4 col-md-3 mb-3 beneficio"[\s\S]*?<!-- Fim div beneficio -->', re.I)
     blocks = card_regex.findall(html)
 
-    for block_html in blocks:
+    for block in blocks:
+        if len(cards) >= limit:
+            break
         try:
-            href_match = re.search(r'<a[^>]+href=["\']([^"\']+)["\']', block_html, re.I)
-            title_match = re.search(r'<p class="titulo mb-0">([\s\S]*?)</p>', block_html, re.I)
-            category_match = re.search(r'data-categoria=["\']([^"\']+)["\']', block_html, re.I)
+            category_match = re.search(r'data-categoria="([^"]*)"', block, re.I)
+            href_match = re.search(r'<a href="([^"]+)"', block, re.I)
+            title_match = re.search(r'<p class="titulo mb-0">([\s\S]*?)</p>', block, re.I)
+            partner_match = re.search(r'<img[^>]+data-src="([^"]*\/parceiros\/[^"]+)"[^>]*alt="([^"]*)"[^>]*title="([^"]*)"', block, re.I)
+            benefit_img_match = re.search(r'<div class="col-12 thumb text-center lazy" data-src="([^"]*\/beneficios\/[^"]+)"', block, re.I)
 
-            if not href_match or not title_match:
-                continue
-
-            link = absolutize_url(href_match.group(1))
-            title = clean_text(re.sub(r"<[^>]+>", " ", title_match.group(1)))
+            link = absolutize_url(href_match.group(1)) if href_match else ""
+            title = clean_text(title_match.group(1)) if title_match else ""
             category = clean_text(category_match.group(1)) if category_match else ""
-            images = choose_images_from_block_html(block_html)
+            partner_img = absolutize_url(partner_match.group(1)) if partner_match else ""
+            partner_alt = clean_text(partner_match.group(2)) if partner_match else ""
+            partner_title = clean_text(partner_match.group(3)) if partner_match else ""
+            benefit_img = absolutize_url(benefit_img_match.group(1)) if benefit_img_match else ""
 
             if not link or not title:
                 continue
 
-            cards.append(
-                {
-                    "id": get_offer_id(link),
-                    "preview_title": title,
-                    "title": title,
-                    "link": link,
-                    "original_link": link,
-                    "category": category,
-                    "img_url": images["img_url"],
-                    "partner_img_url": images["partner_img_url"],
-                }
-            )
+            cards.append({
+                "link": link,
+                "title": title,
+                "category": category,
+                "partner_img_url": partner_img,
+                "partner_name": partner_title or partner_alt or "",
+                "img_url": benefit_img,
+            })
         except Exception:
             continue
 
-    if cards:
-        return uniq_by(cards, lambda o: normalize_offer_key(o.get("id") or o.get("link")))
+    return cards
 
-    # fallback mais próximo do scraper python
-    offers = []
-    block_regex = re.compile(r"<div[^>]+beneficio[^>]*>([\s\S]*?)</div>", re.I)
-    for block_html in block_regex.findall(html):
-        href_match = re.search(r'<a[^>]+href=["\']([^"\']+)["\']', block_html, re.I)
-        title_match = (
-            re.search(r'class=["\'][^"\']*titulo[^"\']*["\'][^>]*>([\s\S]*?)<', block_html, re.I)
-            or re.search(r"<h3[^>]*>([\s\S]*?)</h3>", block_html, re.I)
-            or re.search(r"<h2[^>]*>([\s\S]*?)</h2>", block_html, re.I)
-        )
-        if not href_match or not title_match:
-            continue
-
-        link = absolutize_url(href_match.group(1))
-        title = clean_text(re.sub(r"<[^>]+>", " ", title_match.group(1)))
-        images = choose_images_from_block_html(block_html)
-
-        if not link or not title:
-            continue
-
-        offers.append(
-            {
-                "id": get_offer_id(link),
-                "preview_title": title,
-                "title": title,
-                "link": link,
-                "original_link": link,
-                "category": "",
-                "img_url": images["img_url"],
-                "partner_img_url": images["partner_img_url"],
-            }
-        )
-
-    return uniq_by(offers, lambda o: normalize_offer_key(o.get("id") or o.get("link")))
-
-
-def extract_title_from_detail(html: str, preview_title: str) -> str:
-    for regex in [
-        re.compile(r"<h2[^>]*>([\s\S]*?)</h2>", re.I),
-        re.compile(r"<h1[^>]*>([\s\S]*?)</h1>", re.I),
-    ]:
+def extract_title_from_detail(html: str) -> str:
+    for regex in [re.compile(r"<h2[^>]*>([\s\S]*?)</h2>", re.I), re.compile(r"<h1[^>]*>([\s\S]*?)</h1>", re.I)]:
         m = regex.search(html)
         if m:
-            title = clean_text(re.sub(r"<[^>]+>", " ", m.group(1)))
+            title = clean_text(m.group(1))
             if title:
                 return title
-    return preview_title
-
+    return ""
 
 def extract_validity_from_detail(html: str) -> str:
-    for regex in [
+    regexes = [
         re.compile(r"[Bb]enefício válido de[^.!?\n]*[.!?]?", re.I),
         re.compile(r"[Vv]álido até[^.!?\n]*[.!?]?", re.I),
         re.compile(r"\d{2}/\d{2}/\d{4}[\s\S]{0,80}\d{2}/\d{2}/\d{4}", re.I),
-    ]:
+    ]
+    for regex in regexes:
         m = regex.search(html)
         if m:
-            return clean_text(re.sub(r"<[^>]+>", " ", m.group(0)))
+            return clean_text(m.group(0))
     return ""
 
-
 def extract_description_from_detail(html: str) -> str:
-    for regex in [
+    regexes = [
         re.compile(r'class=["\'][^"\']*info-beneficio[^"\']*["\'][^>]*>([\s\S]*?)(?:<script|<footer|class=["\'][^"\']*box-compartilhar)', re.I),
         re.compile(r'id=["\']beneficio["\'][^>]*>([\s\S]*?)(?:<script|<footer)', re.I),
-    ]:
+    ]
+    for regex in regexes:
         m = regex.search(html)
         if m:
             txt = html_to_text(m.group(1))
@@ -471,129 +235,240 @@ def extract_description_from_detail(html: str) -> str:
                 return txt[:4000]
     return ""
 
-
 def extract_detail_image_from_detail(html: str) -> str:
-    for m in re.finditer(r'<img[^>]+(?:data-src|data-original|data-lazy|src)=["\']([^"\']+)["\']', html, re.I):
+    matches = re.finditer(r'<img[^>]+(?:data-src|data-original|data-lazy|src)="([^"]+)"', html, re.I)
+    for m in matches:
         src = absolutize_url(m.group(1))
-        if is_likely_benefit_banner(src):
+        if "/beneficios/" in src or "/campanhasdeingresso/" in src:
             return src
-
-    for m in re.finditer(r'<img[^>]+(?:data-src|data-original|data-lazy|src)=["\']([^"\']+)["\']', html, re.I):
-        src = absolutize_url(m.group(1))
-        if src and not is_bad_banner_url(src):
-            return src
-
     return ""
 
+def fetch_offer_detail_data(offer: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        html = fetch_text(offer["link"], LIST_URL)
+        if not html or len(html.strip()) < 1000:
+            return {
+                "ok": False,
+                "url": offer["link"],
+                "title": offer["title"],
+                "html_length": len(html) if html else 0,
+                "validity": "",
+                "description": "",
+                "detail_img_url": "",
+                "error": "html detalhe vazia ou curta",
+            }
 
-def fetch_detail_probe(offer: Dict[str, Any]) -> Dict[str, Any]:
-    result = get_html(offer["link"])
-    if not result["ok"] or not result["text"]:
+        detail_title = extract_title_from_detail(html) or offer["title"]
+        validity = extract_validity_from_detail(html)
+        description = extract_description_from_detail(html)
+        detail_img = extract_detail_image_from_detail(html)
+
+        return {
+            "ok": True,
+            "url": offer["link"],
+            "title": detail_title,
+            "html_length": len(html),
+            "validity": validity,
+            "description": description,
+            "detail_img_url": detail_img,
+            "has_validity": bool(validity),
+            "has_description": bool(description),
+            "error": "",
+        }
+    except RequestException as e:
         return {
             "ok": False,
-            "status_code": result["status_code"],
-            "elapsed_s": result["elapsed_s"],
-            "error": result["error"],
+            "url": offer["link"],
             "title": offer["title"],
-            "validity": "",
-            "description_preview": "",
-            "detail_img_url": "",
             "html_length": 0,
+            "validity": "",
+            "description": "",
+            "detail_img_url": "",
+            "error": str(e),
         }
 
-    html = result["text"]
-    title = extract_title_from_detail(html, offer["title"])
-    validity = extract_validity_from_detail(html)
-    description = extract_description_from_detail(html)
-    detail_img = extract_detail_image_from_detail(html)
+def load_seen_cache() -> Dict[str, Any]:
+    result = github_get_file(SEEN_CACHE_FILE)
+    if not result["ok"]:
+        return {"seen": [], "updated_at": "", "error": result["error"]}
+    if not result["exists"] or not result["content"]:
+        return {"seen": [], "updated_at": "", "error": ""}
+    try:
+        data = json.loads(result["content"])
+        seen = data.get("seen", [])
+        return {"seen": [normalize_link(x) for x in seen if normalize_link(x)], "updated_at": str(data.get("updated_at") or ""), "error": ""}
+    except Exception as e:
+        return {"seen": [], "updated_at": "", "error": str(e)}
 
-    return {
-        "ok": True,
-        "status_code": result["status_code"],
-        "elapsed_s": result["elapsed_s"],
-        "error": "",
-        "title": title,
-        "validity": validity,
-        "description_preview": description[:500],
-        "detail_img_url": detail_img,
-        "html_length": len(html),
+def save_seen_cache(seen_links: List[str]) -> Dict[str, Any]:
+    unique = []
+    seen_set = set()
+    for link in seen_links:
+        norm = normalize_link(link)
+        if not norm or norm in seen_set:
+            continue
+        seen_set.add(norm)
+        unique.append(norm)
+    payload = {"seen": unique[-MAX_SEEN_LINKS:], "updated_at": now_iso()}
+    return github_put_file(SEEN_CACHE_FILE, json.dumps(payload, indent=2, ensure_ascii=False), f"update railway seen links {now_iso()}")
+
+def load_status_runtime() -> Dict[str, Any]:
+    result = github_get_file(STATUS_RUNTIME_FILE)
+    if not result["ok"] or not result["exists"] or not result["content"]:
+        return {"scriptable": {"last_started_at": "", "last_finished_at": "", "status": "", "summary": "", "offers_seen": 0, "new_offers": 0, "pending_count": 0, "last_error": ""}}
+    try:
+        return json.loads(result["content"])
+    except Exception:
+        return {"scriptable": {"last_started_at": "", "last_finished_at": "", "status": "", "summary": "", "offers_seen": 0, "new_offers": 0, "pending_count": 0, "last_error": ""}}
+
+def save_status_runtime(state: Dict[str, Any]) -> Dict[str, Any]:
+    return github_put_file(STATUS_RUNTIME_FILE, json.dumps(state, indent=2, ensure_ascii=False), f"update status runtime by railway {now_iso()}")
+
+def set_scriptable_status_start(state: Dict[str, Any], cache_size: int) -> Dict[str, Any]:
+    state["scriptable"] = {
+        "last_started_at": now_iso(),
+        "last_finished_at": state.get("scriptable", {}).get("last_finished_at", ""),
+        "status": "running",
+        "summary": "railway collector iniciado",
+        "offers_seen": 0,
+        "new_offers": 0,
+        "pending_count": cache_size,
+        "last_error": "",
     }
+    return state
 
+def set_scriptable_status_finish(state: Dict[str, Any], status_value: str, summary: str, offers_seen: int, new_offers: int, pending_count: int, last_error: str = "") -> Dict[str, Any]:
+    state["scriptable"] = {
+        "last_started_at": state.get("scriptable", {}).get("last_started_at", ""),
+        "last_finished_at": now_iso(),
+        "status": status_value,
+        "summary": summary,
+        "offers_seen": offers_seen,
+        "new_offers": new_offers,
+        "pending_count": pending_count,
+        "last_error": last_error,
+    }
+    return state
 
-def run_probe() -> Dict[str, Any]:
-    result = get_html(LIST_URL)
-    html = result["text"] if result["ok"] else ""
+def main() -> int:
+    if not GITHUB_TOKEN:
+        log("erro: GITHUB_TOKEN ausente")
+        return 1
 
-    offers = parse_offers_like_latest_flow(html) if html else []
-    sample_offers = offers[:3]
+    snapshot_id = build_snapshot_id()
+    html_path = f"snapshots/snapshot_{snapshot_id}.html"
+    meta_path = f"snapshots/snapshot_{snapshot_id}.json"
+    detail_meta_path = f"snapshots/detail_{snapshot_id}.json"
 
-    detail_tests = []
-    if TEST_DETAIL_FETCH and offers:
-        for offer in offers[:MAX_DETAIL_TESTS]:
-            detail_tests.append(
-                {
-                    "link": offer["link"],
-                    "card_title": offer["title"],
-                    "detail": fetch_detail_probe(offer),
-                }
-            )
+    status = load_status_runtime()
+    seen_cache = load_seen_cache()
+    seen_links = seen_cache.get("seen", [])
 
-    summary = {
-        "tested_at": now_utc_iso(),
-        "list_probe": {
-            "ok": result["ok"],
-            "status_code": result["status_code"],
-            "elapsed_s": result["elapsed_s"],
-            "error": result["error"],
-            "used_insecure_fallback": result["used_insecure_fallback"],
+    status = set_scriptable_status_start(status, len(seen_links))
+    save_status_runtime(status)
+
+    try:
+        html = fetch_text(LIST_URL, BASE_URL + "/")
+        if not html or len(html.strip()) < 1000:
+            status = set_scriptable_status_finish(status, "erro", "html vazia ou curta demais", 0, 0, len(seen_links), "html vazia")
+            save_status_runtime(status)
+            log("erro: html vazia ou curta demais")
+            return 1
+
+        all_offers = extract_offer_cards(html, 60)
+        seen_set = set(seen_links)
+        new_offers = [o for o in all_offers if normalize_link(o["link"]) not in seen_set]
+        offers_to_test = new_offers[:MAX_DETAIL_FETCHES]
+
+        meta = {
+            "snapshot_id": snapshot_id,
+            "created_at": now_iso(),
+            "source_url": LIST_URL,
+            "html_path": html_path,
             "html_length": len(html),
-            "offers_found": len(offers),
-        },
-        "offers_sample": sample_offers,
-        "detail_tests": detail_tests,
-    }
+            "total_offers_found": len(all_offers),
+            "total_new_offers_found": len(new_offers),
+            "tested_detail_count": len(offers_to_test),
+            "cache_size_before": len(seen_links),
+            "context": "railway",
+        }
 
-    return summary
+        put_html = github_put_file(html_path, html, f"railway snapshot html {snapshot_id}")
+        if not put_html["ok"]:
+            raise RuntimeError(put_html["error"])
 
+        put_meta = github_put_file(meta_path, json.dumps(meta, indent=2, ensure_ascii=False), f"railway snapshot meta {snapshot_id}")
+        if not put_meta["ok"]:
+            raise RuntimeError(put_meta["error"])
 
-def print_human_summary(summary: Dict[str, Any]) -> None:
-    list_probe = summary["list_probe"]
-    line = (
-        f'{summary["tested_at"]} | '
-        f'list_ok={list_probe["ok"]} | '
-        f'status={list_probe["status_code"]} | '
-        f'html={list_probe["html_length"]} | '
-        f'offers={list_probe["offers_found"]} | '
-        f'tempo={list_probe["elapsed_s"]}s | '
-        f'fallback_ssl={list_probe["used_insecure_fallback"]}'
-    )
-    log(line)
+        detail_results = []
+        ok_count = 0
 
-    if list_probe["error"]:
-        log(f'erro_lista={list_probe["error"]}')
+        for i, offer in enumerate(offers_to_test, start=1):
+            detail = fetch_offer_detail_data(offer)
+            if detail["ok"]:
+                ok_count += 1
+            detail_results.append({
+                "index": i,
+                "link": offer["link"],
+                "card_title": offer["title"],
+                "category": offer["category"],
+                "partner_name": offer["partner_name"],
+                "partner_img_url": offer["partner_img_url"],
+                "card_img_url": offer["img_url"],
+                "detail_ok": detail["ok"],
+                "detail_title": detail.get("title", ""),
+                "detail_html_length": detail.get("html_length", 0),
+                "validity": detail.get("validity", ""),
+                "has_validity": bool(detail.get("validity")),
+                "description": detail.get("description", ""),
+                "description_preview": (detail.get("description", "") or "")[:500],
+                "has_description": bool(detail.get("description")),
+                "detail_img_url": detail.get("detail_img_url", ""),
+                "error": detail.get("error", ""),
+            })
 
-    for i, offer in enumerate(summary["offers_sample"], start=1):
-        log(
-            f'oferta_{i} | '
-            f'id={offer.get("id")} | '
-            f'titulo={offer.get("title")} | '
-            f'link={offer.get("link")}'
+        detail_meta = {
+            "snapshot_id": snapshot_id,
+            "tested_at": now_iso(),
+            "tested_count": len(offers_to_test),
+            "detail_ok_count": ok_count,
+            "detail_fail_count": len(offers_to_test) - ok_count,
+            "cache_size_before": len(seen_links),
+            "cache_size_after": len(seen_links) + len(offers_to_test),
+            "offers": detail_results,
+        }
+
+        put_detail = github_put_file(detail_meta_path, json.dumps(detail_meta, indent=2, ensure_ascii=False), f"railway detail meta {snapshot_id}")
+        if not put_detail["ok"]:
+            raise RuntimeError(put_detail["error"])
+
+        merged_seen = seen_links + [normalize_link(o["link"]) for o in offers_to_test]
+        save_seen = save_seen_cache(merged_seen)
+        if not save_seen["ok"]:
+            raise RuntimeError(save_seen["error"])
+
+        status = set_scriptable_status_finish(
+            status,
+            "ok",
+            f"railway snapshots ok: {snapshot_id} | detalhes {ok_count}/{len(offers_to_test)}",
+            len(all_offers),
+            len(new_offers),
+            min(len(set(merged_seen)), MAX_SEEN_LINKS),
+            "",
         )
+        save_status_runtime(status)
 
-    for i, detail in enumerate(summary["detail_tests"], start=1):
-        d = detail["detail"]
-        log(
-            f'detalhe_{i} | '
-            f'ok={d["ok"]} | '
-            f'status={d["status_code"]} | '
-            f'tempo={d["elapsed_s"]}s | '
-            f'titulo={d["title"]} | '
-            f'validade={"sim" if d["validity"] else "nao"} | '
-            f'descricao={"sim" if d["description_preview"] else "nao"}'
-        )
+        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{len(new_offers)},{len(offers_to_test)},{ok_count},false,""'
+        log(csv_line)
+        return 0
 
+    except Exception as e:
+        status = set_scriptable_status_finish(status, "erro", "erro geral no railway collector", 0, 0, len(seen_links), str(e))
+        save_status_runtime(status)
+        safe_error = str(e).replace('"', "'")
+        log(f'{now_iso()},false,0,0,0,0,0,0,false,"{safe_error}"')
+        return 1
 
 if __name__ == "__main__":
-    summary = run_probe()
-    print_human_summary(summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    raise SystemExit(main())
