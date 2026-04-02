@@ -1,2 +1,1 @@
-requests==2.32.3
-certifi==2025.1.31
+requests==2.32.3\ncertifi==2025.1.31\n
