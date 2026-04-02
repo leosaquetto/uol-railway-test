@@ -5,17 +5,18 @@ import random
 import re
 import string
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import certifi
 import requests
 import urllib3
-from requests.exceptions import RequestException, SSLError
+from requests.exceptions import HTTPError, RequestException, SSLError
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://clube.uol.com.br"
 LIST_URL = f"{BASE_URL}/?order=new"
+FALLBACK_LIST_URL = f"{BASE_URL}/"
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "leosaquetto")
 REPO_NAME = os.environ.get("REPO_NAME", "uol-bot")
@@ -262,8 +263,8 @@ def build_snapshot_id() -> str:
     return f"{d.year}{pad(d.month)}{pad(d.day)}_{pad(d.hour)}{pad(d.minute)}{pad(d.second)}_{rand}"
 
 
-def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
-    headers = {
+def build_request_headers(referer: str) -> Dict[str, str]:
+    return {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -271,24 +272,59 @@ def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
         "Cache-Control": "no-cache",
     }
 
+
+def fetch_once(url: str, referer: str, verify_value) -> requests.Response:
+    headers = build_request_headers(referer)
+    resp = requests.get(
+        url,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        verify=verify_value,
+        allow_redirects=True,
+    )
+    return resp
+
+
+def fetch_text_with_fallback() -> Tuple[str, str]:
+    candidates = [
+        (LIST_URL, BASE_URL + "/"),
+        (FALLBACK_LIST_URL, BASE_URL + "/"),
+    ]
+
+    last_error = None
+
+    for url, referer in candidates:
+        try:
+            resp = fetch_once(url, referer, certifi.where())
+            resp.raise_for_status()
+            log(f"coleta ok via: {url}")
+            return resp.text, url
+        except SSLError:
+            try:
+                resp = fetch_once(url, referer, False)
+                resp.raise_for_status()
+                log(f"coleta ok via fallback ssl: {url}")
+                return resp.text, url
+            except Exception as e:
+                last_error = e
+                log(f"falha coleta via {url}: {e}")
+        except HTTPError as e:
+            last_error = e
+            log(f"http error via {url}: {e}")
+        except RequestException as e:
+            last_error = e
+            log(f"request error via {url}: {e}")
+
+    raise RuntimeError(str(last_error) if last_error else "falha ao coletar vitrine")
+
+
+def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
     try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            verify=certifi.where(),
-            allow_redirects=True,
-        )
+        resp = fetch_once(url, referer, certifi.where())
         resp.raise_for_status()
         return resp.text
     except SSLError:
-        resp = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            verify=False,
-            allow_redirects=True,
-        )
+        resp = fetch_once(url, referer, False)
         resp.raise_for_status()
         return resp.text
 
@@ -648,7 +684,7 @@ def main() -> int:
     save_status_runtime(status)
 
     try:
-        html = fetch_text(LIST_URL, BASE_URL + "/")
+        html, source_url = fetch_text_with_fallback()
         if not html or len(html.strip()) < 1000:
             current_pending = load_pending_count()
             status = set_scriptable_status_finish(
@@ -666,7 +702,6 @@ def main() -> int:
 
         all_offers = extract_offer_cards(html, 60)
 
-        # filtro oficial: histórico + pending por id/link
         id_candidates: List[Dict[str, Any]] = []
         for offer in all_offers:
             offer_key = normalize_offer_key(offer.get("id") or offer.get("link"))
@@ -676,7 +711,6 @@ def main() -> int:
                 continue
             id_candidates.append(offer)
 
-        # apoio secundário: ordena priorizando links ainda não vistos pelo seen cache
         seen_set = set(seen_links)
         prioritized_candidates = sorted(
             id_candidates,
@@ -738,7 +772,7 @@ def main() -> int:
         meta = {
             "snapshot_id": snapshot_id,
             "created_at": now_iso(),
-            "source_url": LIST_URL,
+            "source_url": source_url,
             "html_path": html_path,
             "html_length": len(html),
             "total_offers_found": len(all_offers),
@@ -794,7 +828,7 @@ def main() -> int:
         status = set_scriptable_status_finish(
             status,
             "ok",
-            f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | novas reais {real_new_count} | detalhes {ok_count}/{tested_count}",
+            f"railway coleta ok: {snapshot_id} | origem {source_url} | vitrine {len(all_offers)} | novas reais {real_new_count} | detalhes {ok_count}/{tested_count}",
             len(all_offers),
             real_new_count,
             current_pending,
