@@ -71,7 +71,11 @@ def base64_decode(text: str) -> Optional[str]:
 
 def github_get_file(path: str) -> Dict[str, Any]:
     try:
-        resp = requests.get(github_api_url(path), headers=build_headers_json(), timeout=REQUEST_TIMEOUT)
+        resp = requests.get(
+            github_api_url(path),
+            headers=build_headers_json(),
+            timeout=REQUEST_TIMEOUT,
+        )
         if resp.status_code == 404:
             return {"ok": True, "exists": False, "content": None, "sha": None}
         data = resp.json()
@@ -93,7 +97,12 @@ def github_put_file(path: str, content: str, message: str) -> Dict[str, Any]:
         body["sha"] = current["sha"]
 
     try:
-        resp = requests.put(github_api_url(path), headers=build_headers_json(), json=body, timeout=REQUEST_TIMEOUT)
+        resp = requests.put(
+            github_api_url(path),
+            headers=build_headers_json(),
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
         data = resp.json()
         if resp.ok and data.get("commit"):
             return {"ok": True, "data": data}
@@ -196,18 +205,33 @@ def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=certifi.where(), allow_redirects=True)
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            verify=certifi.where(),
+            allow_redirects=True,
+        )
         resp.raise_for_status()
         return resp.text
     except SSLError:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False, allow_redirects=True)
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+            allow_redirects=True,
+        )
         resp.raise_for_status()
         return resp.text
 
 
 def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
     cards = []
-    card_regex = re.compile(r'<div class="col-12 col-sm-4 col-md-3 mb-3 beneficio"[\s\S]*?<!-- Fim div beneficio -->', re.I)
+    card_regex = re.compile(
+        r'<div class="col-12 col-sm-4 col-md-3 mb-3 beneficio"[\s\S]*?<!-- Fim div beneficio -->',
+        re.I,
+    )
     blocks = card_regex.findall(html)
 
     for block in blocks:
@@ -217,8 +241,16 @@ def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
             category_match = re.search(r'data-categoria="([^"]*)"', block, re.I)
             href_match = re.search(r'<a href="([^"]+)"', block, re.I)
             title_match = re.search(r'<p class="titulo mb-0">([\s\S]*?)</p>', block, re.I)
-            partner_match = re.search(r'<img[^>]+data-src="([^"]*\/parceiros\/[^"]+)"[^>]*alt="([^"]*)"[^>]*title="([^"]*)"', block, re.I)
-            benefit_img_match = re.search(r'<div class="col-12 thumb text-center lazy" data-src="([^"]*\/beneficios\/[^"]+)"', block, re.I)
+            partner_match = re.search(
+                r'<img[^>]+data-src="([^"]*\/parceiros\/[^"]+)"[^>]*alt="([^"]*)"[^>]*title="([^"]*)"',
+                block,
+                re.I,
+            )
+            benefit_img_match = re.search(
+                r'<div class="col-12 thumb text-center lazy" data-src="([^"]*\/beneficios\/[^"]+)"',
+                block,
+                re.I,
+            )
 
             link = absolutize_url(href_match.group(1)) if href_match else ""
             title = clean_text(title_match.group(1)) if title_match else ""
@@ -232,15 +264,17 @@ def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
             if not link or not title:
                 continue
 
-            cards.append({
-                "id": offer_id,
-                "link": link,
-                "title": title,
-                "category": category,
-                "partner_img_url": partner_img,
-                "partner_name": partner_title or partner_alt or "",
-                "img_url": benefit_img,
-            })
+            cards.append(
+                {
+                    "id": offer_id,
+                    "link": link,
+                    "title": title,
+                    "category": category,
+                    "partner_img_url": partner_img,
+                    "partner_name": partner_title or partner_alt or "",
+                    "img_url": benefit_img,
+                }
+            )
         except Exception:
             continue
 
@@ -248,7 +282,10 @@ def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
 
 
 def extract_title_from_detail(html: str) -> str:
-    for regex in [re.compile(r"<h2[^>]*>([\s\S]*?)</h2>", re.I), re.compile(r"<h1[^>]*>([\s\S]*?)</h1>", re.I)]:
+    for regex in [
+        re.compile(r"<h2[^>]*>([\s\S]*?)</h2>", re.I),
+        re.compile(r"<h1[^>]*>([\s\S]*?)</h1>", re.I),
+    ]:
         m = regex.search(html)
         if m:
             title = clean_text(m.group(1))
@@ -272,7 +309,10 @@ def extract_validity_from_detail(html: str) -> str:
 
 def extract_description_from_detail(html: str) -> str:
     regexes = [
-        re.compile(r'class=["\'][^"\']*info-beneficio[^"\']*["\'][^>]*>([\s\S]*?)(?:<script|<footer|class=["\'][^"\']*box-compartilhar)', re.I),
+        re.compile(
+            r'class=["\'][^"\']*info-beneficio[^"\']*["\'][^>]*>([\s\S]*?)(?:<script|<footer|class=["\'][^"\']*box-compartilhar)',
+            re.I,
+        ),
         re.compile(r'id=["\']beneficio["\'][^>]*>([\s\S]*?)(?:<script|<footer)', re.I),
     ]
     for regex in regexes:
@@ -347,7 +387,11 @@ def load_seen_cache() -> Dict[str, Any]:
     try:
         data = json.loads(result["content"])
         seen = data.get("seen", [])
-        return {"seen": [normalize_link(x) for x in seen if normalize_link(x)], "updated_at": str(data.get("updated_at") or ""), "error": ""}
+        return {
+            "seen": [normalize_link(x) for x in seen if normalize_link(x)],
+            "updated_at": str(data.get("updated_at") or ""),
+            "error": "",
+        }
     except Exception as e:
         return {"seen": [], "updated_at": "", "error": str(e)}
 
@@ -362,21 +406,51 @@ def save_seen_cache(seen_links: List[str]) -> Dict[str, Any]:
         seen_set.add(norm)
         unique.append(norm)
     payload = {"seen": unique[-MAX_SEEN_LINKS:], "updated_at": now_iso()}
-    return github_put_file(SEEN_CACHE_FILE, json.dumps(payload, indent=2, ensure_ascii=False), f"update railway seen links {now_iso()}")
+    return github_put_file(
+        SEEN_CACHE_FILE,
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        f"update railway seen links {now_iso()}",
+    )
 
 
 def load_status_runtime() -> Dict[str, Any]:
     result = github_get_file(STATUS_RUNTIME_FILE)
     if not result["ok"] or not result["exists"] or not result["content"]:
-        return {"scriptable": {"last_started_at": "", "last_finished_at": "", "status": "", "summary": "", "offers_seen": 0, "new_offers": 0, "pending_count": 0, "last_error": ""}}
+        return {
+            "scriptable": {
+                "last_started_at": "",
+                "last_finished_at": "",
+                "status": "",
+                "summary": "",
+                "offers_seen": 0,
+                "new_offers": 0,
+                "pending_count": 0,
+                "last_error": "",
+            }
+        }
     try:
         return json.loads(result["content"])
     except Exception:
-        return {"scriptable": {"last_started_at": "", "last_finished_at": "", "status": "", "summary": "", "offers_seen": 0, "new_offers": 0, "pending_count": 0, "last_error": ""}}
+        return {
+            "scriptable": {
+                "last_started_at": "",
+                "last_finished_at": "",
+                "status": "",
+                "summary": "",
+                "offers_seen": 0,
+                "new_offers": 0,
+                "pending_count": 0,
+                "last_error": "",
+            }
+        }
 
 
 def save_status_runtime(state: Dict[str, Any]) -> Dict[str, Any]:
-    return github_put_file(STATUS_RUNTIME_FILE, json.dumps(state, indent=2, ensure_ascii=False), f"update status runtime by railway {now_iso()}")
+    return github_put_file(
+        STATUS_RUNTIME_FILE,
+        json.dumps(state, indent=2, ensure_ascii=False),
+        f"update status runtime by railway {now_iso()}",
+    )
 
 
 def load_history_ids() -> Set[str]:
@@ -418,7 +492,15 @@ def set_scriptable_status_start(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
-def set_scriptable_status_finish(state: Dict[str, Any], status_value: str, summary: str, offers_seen: int, new_offers: int, pending_count: int, last_error: str = "") -> Dict[str, Any]:
+def set_scriptable_status_finish(
+    state: Dict[str, Any],
+    status_value: str,
+    summary: str,
+    offers_seen: int,
+    new_offers: int,
+    pending_count: int,
+    last_error: str = "",
+) -> Dict[str, Any]:
     state["scriptable"] = {
         "last_started_at": state.get("scriptable", {}).get("last_started_at", ""),
         "last_finished_at": now_iso(),
@@ -454,7 +536,15 @@ def main() -> int:
         html = fetch_text(LIST_URL, BASE_URL + "/")
         if not html or len(html.strip()) < 1000:
             current_pending = load_pending_count()
-            status = set_scriptable_status_finish(status, "erro", "html vazia ou curta demais", 0, 0, current_pending, "html vazia")
+            status = set_scriptable_status_finish(
+                status,
+                "erro",
+                "html vazia ou curta demais",
+                0,
+                0,
+                current_pending,
+                "html vazia",
+            )
             save_status_runtime(status)
             log("erro: html vazia ou curta demais")
             return 1
@@ -484,7 +574,11 @@ def main() -> int:
         if not put_html["ok"]:
             raise RuntimeError(put_html["error"])
 
-        put_meta = github_put_file(meta_path, json.dumps(meta, indent=2, ensure_ascii=False), f"railway snapshot meta {snapshot_id}")
+        put_meta = github_put_file(
+            meta_path,
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            f"railway snapshot meta {snapshot_id}",
+        )
         if not put_meta["ok"]:
             raise RuntimeError(put_meta["error"])
 
@@ -495,26 +589,28 @@ def main() -> int:
             detail = fetch_offer_detail_data(offer)
             if detail["ok"]:
                 ok_count += 1
-            detail_results.append({
-                "index": i,
-                "id": offer.get("id", ""),
-                "link": offer["link"],
-                "card_title": offer["title"],
-                "category": offer["category"],
-                "partner_name": offer["partner_name"],
-                "partner_img_url": offer["partner_img_url"],
-                "card_img_url": offer["img_url"],
-                "detail_ok": detail["ok"],
-                "detail_title": detail.get("title", ""),
-                "detail_html_length": detail.get("html_length", 0),
-                "validity": detail.get("validity", ""),
-                "has_validity": bool(detail.get("validity")),
-                "description": detail.get("description", ""),
-                "description_preview": (detail.get("description", "") or "")[:500],
-                "has_description": bool(detail.get("description")),
-                "detail_img_url": detail.get("detail_img_url", ""),
-                "error": detail.get("error", ""),
-            })
+            detail_results.append(
+                {
+                    "index": i,
+                    "id": offer.get("id", ""),
+                    "link": offer["link"],
+                    "card_title": offer["title"],
+                    "category": offer["category"],
+                    "partner_name": offer["partner_name"],
+                    "partner_img_url": offer["partner_img_url"],
+                    "card_img_url": offer["img_url"],
+                    "detail_ok": detail["ok"],
+                    "detail_title": detail.get("title", ""),
+                    "detail_html_length": detail.get("html_length", 0),
+                    "validity": detail.get("validity", ""),
+                    "has_validity": bool(detail.get("validity")),
+                    "description": detail.get("description", ""),
+                    "description_preview": (detail.get("description", "") or "")[:500],
+                    "has_description": bool(detail.get("description")),
+                    "detail_img_url": detail.get("detail_img_url", ""),
+                    "error": detail.get("error", ""),
+                }
+            )
 
         detail_meta = {
             "snapshot_id": snapshot_id,
@@ -527,7 +623,11 @@ def main() -> int:
             "offers": detail_results,
         }
 
-        put_detail = github_put_file(detail_meta_path, json.dumps(detail_meta, indent=2, ensure_ascii=False), f"railway detail meta {snapshot_id}")
+        put_detail = github_put_file(
+            detail_meta_path,
+            json.dumps(detail_meta, indent=2, ensure_ascii=False),
+            f"railway detail meta {snapshot_id}",
+        )
         if not put_detail["ok"]:
             raise RuntimeError(put_detail["error"])
 
@@ -536,7 +636,7 @@ def main() -> int:
         if not save_seen["ok"]:
             raise RuntimeError(save_seen["error"])
 
-               current_pending = load_pending_count()
+        current_pending = load_pending_count()
         status = set_scriptable_status_finish(
             status,
             "ok",
@@ -554,7 +654,15 @@ def main() -> int:
 
     except Exception as e:
         current_pending = load_pending_count()
-        status = set_scriptable_status_finish(status, "erro", "erro geral no railway collector", 0, 0, current_pending, str(e))
+        status = set_scriptable_status_finish(
+            status,
+            "erro",
+            "erro geral no railway collector",
+            0,
+            0,
+            current_pending,
+            str(e),
+        )
         save_status_runtime(status)
         safe_error = str(e).replace('"', "'")
         log(f'{now_iso()},false,0,0,0,0,0,0,false,"{safe_error}"')
