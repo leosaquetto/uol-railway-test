@@ -553,6 +553,7 @@ def main() -> int:
         seen_set = set(seen_links)
         detail_candidates = [o for o in all_offers if normalize_link(o["link"]) not in seen_set]
         real_new_offers = [o for o in all_offers if o.get("id", "").strip().lower() not in history_ids]
+        num_real_new_offers = len(real_new_offers)
         offers_to_test = detail_candidates[:MAX_DETAIL_FETCHES]
 
         meta = {
@@ -563,7 +564,7 @@ def main() -> int:
             "html_length": len(html),
             "total_offers_found": len(all_offers),
             "detail_candidate_count": len(detail_candidates),
-            "total_new_offers_found": len(real_new_offers),
+            "total_new_offers_found": num_real_new_offers,
             "tested_detail_count": len(offers_to_test),
             "cache_size_before": len(seen_links),
             "history_size": len(history_ids),
@@ -642,13 +643,13 @@ def main() -> int:
             "ok",
             f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | detalhes {ok_count}/{len(offers_to_test)}",
             len(all_offers),
-            0,
+            num_real_new_offers,
             current_pending,
             "",
         )
         save_status_runtime(status)
 
-        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},0,{len(offers_to_test)},{ok_count},false,""'
+        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{num_real_new_offers},{len(offers_to_test)},{ok_count},false,""'
         log(csv_line)
         return 0
 
