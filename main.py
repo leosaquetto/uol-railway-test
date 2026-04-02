@@ -538,18 +538,17 @@ def main() -> int:
 
         current_pending = load_pending_count()
         status = set_scriptable_status_finish(
-            status,
-            "ok",
-            f"railway snapshots ok: {snapshot_id} | detalhes {ok_count}/{len(offers_to_test)}",
-            len(all_offers),
-            len(real_new_offers),
-            current_pending,
-            "",
-        )
-        save_status_runtime(status)
+    status,
+    "ok",
+    f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | detalhes {ok_count}/{len(offers_to_test)}",
+    len(all_offers),
+    0,
+    current_pending,
+    "",
+)
+save_status_runtime(status)
 
-        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{len(real_new_offers)},{len(offers_to_test)},{ok_count},false,""'
-        log(csv_line)
+csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},0,{len(offers_to_test)},{ok_count},false,""'
         return 0
 
     except Exception as e:
