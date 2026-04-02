@@ -536,19 +536,20 @@ def main() -> int:
         if not save_seen["ok"]:
             raise RuntimeError(save_seen["error"])
 
-        current_pending = load_pending_count()
+               current_pending = load_pending_count()
         status = set_scriptable_status_finish(
-    status,
-    "ok",
-    f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | detalhes {ok_count}/{len(offers_to_test)}",
-    len(all_offers),
-    0,
-    current_pending,
-    "",
-)
-save_status_runtime(status)
+            status,
+            "ok",
+            f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | detalhes {ok_count}/{len(offers_to_test)}",
+            len(all_offers),
+            0,
+            current_pending,
+            "",
+        )
+        save_status_runtime(status)
 
-csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},0,{len(offers_to_test)},{ok_count},false,""'
+        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},0,{len(offers_to_test)},{ok_count},false,""'
+        log(csv_line)
         return 0
 
     except Exception as e:
