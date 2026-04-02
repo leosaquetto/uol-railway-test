@@ -185,6 +185,73 @@ def build_offer_id_from_link(link: str, fallback_title: str = "") -> str:
     return slugify_text(fallback_title or link)
 
 
+def normalize_text_key(value: Optional[str]) -> str:
+    raw = clean_text(value or "").lower()
+    if not raw:
+        return ""
+    replacements = {
+        "á": "a", "à": "a", "ã": "a", "â": "a", "ä": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "í": "i", "ì": "i", "î": "i", "ï": "i",
+        "ó": "o", "ò": "o", "ô": "o", "õ": "o", "ö": "o",
+        "ú": "u", "ù": "u", "û": "u", "ü": "u",
+        "ç": "c",
+    }
+    for src, dst in replacements.items():
+        raw = raw.replace(src, dst)
+    raw = re.sub(r"https?://", "", raw)
+    raw = re.sub(r"[^a-z0-9]+", "-", raw)
+    raw = re.sub(r"-{2,}", "-", raw)
+    return raw.strip("-")
+
+
+def normalize_offer_key(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        raw = build_offer_id_from_link(raw)
+    return normalize_text_key(raw)
+
+
+def pick_description_anchor(description: str) -> str:
+    if not description:
+        return ""
+    lines = [clean_text(x) for x in str(description).splitlines()]
+    filtered = []
+    blacklist_starts = (
+        "beneficio valido",
+        "valido ate",
+        "local",
+        "quando",
+        "importante",
+        "regras de resgate",
+        "atencao",
+        "atenção",
+        "enviar cupons por e-mail",
+        "preencha os campos abaixo",
+        "e-mail",
+        "mensagem",
+        "enviar",
+    )
+    for line in lines:
+        low = normalize_text_key(line)
+        if not low or len(low) < 12:
+            continue
+        if any(low.startswith(normalize_text_key(x)) for x in blacklist_starts):
+            continue
+        filtered.append(low)
+    return filtered[0][:160] if filtered else ""
+
+
+def build_dedupe_key(title: str, validity: Optional[str], description: str) -> str:
+    title_key = normalize_text_key(title)
+    validity_key = normalize_text_key(validity or "")
+    desc_key = pick_description_anchor(description)
+    parts = [x for x in [title_key, validity_key, desc_key] if x]
+    return "|".join(parts)
+
+
 def pad(n: int) -> str:
     return str(n).zfill(2)
 
@@ -453,28 +520,65 @@ def save_status_runtime(state: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def load_history_ids() -> Set[str]:
+def load_history_data() -> Dict[str, Any]:
     result = github_get_file(HISTORY_FILE)
     if not result["ok"] or not result["exists"] or not result["content"]:
-        return set()
+        return {"ids": [], "dedupe_keys": []}
     try:
-        data = json.loads(result["content"])
-        ids = data.get("ids", [])
-        return {str(x).strip().lower() for x in ids if str(x).strip()}
+        return json.loads(result["content"])
     except Exception:
-        return set()
+        return {"ids": [], "dedupe_keys": []}
+
+
+def extract_history_sets(history_data: Dict[str, Any]) -> tuple[Set[str], Set[str]]:
+    ids = history_data.get("ids", [])
+    dedupe_keys = history_data.get("dedupe_keys", [])
+    if not isinstance(ids, list):
+        ids = []
+    if not isinstance(dedupe_keys, list):
+        dedupe_keys = []
+    id_set = {normalize_offer_key(x) for x in ids if normalize_offer_key(x)}
+    dedupe_set = {str(x).strip() for x in dedupe_keys if str(x).strip()}
+    return id_set, dedupe_set
+
+
+def load_pending_data() -> Dict[str, Any]:
+    result = github_get_file(PENDING_FILE)
+    if not result["ok"] or not result["exists"] or not result["content"]:
+        return {"offers": []}
+    try:
+        return json.loads(result["content"])
+    except Exception:
+        return {"offers": []}
+
+
+def extract_pending_sets(pending_data: Dict[str, Any]) -> tuple[Set[str], Set[str]]:
+    offers = pending_data.get("offers", [])
+    if not isinstance(offers, list):
+        offers = []
+    id_set: Set[str] = set()
+    dedupe_set: Set[str] = set()
+    for o in offers:
+        offer_key = normalize_offer_key(o.get("id") or o.get("link"))
+        if offer_key:
+            id_set.add(offer_key)
+
+        dedupe_key = str(o.get("dedupe_key") or "").strip()
+        if not dedupe_key:
+            dedupe_key = build_dedupe_key(
+                title=o.get("title") or o.get("preview_title") or "",
+                validity=o.get("validity"),
+                description=o.get("description") or "",
+            )
+        if dedupe_key:
+            dedupe_set.add(dedupe_key)
+    return id_set, dedupe_set
 
 
 def load_pending_count() -> int:
-    result = github_get_file(PENDING_FILE)
-    if not result["ok"] or not result["exists"] or not result["content"]:
-        return 0
-    try:
-        data = json.loads(result["content"])
-        offers = data.get("offers", [])
-        return len(offers) if isinstance(offers, list) else 0
-    except Exception:
-        return 0
+    pending_data = load_pending_data()
+    offers = pending_data.get("offers", [])
+    return len(offers) if isinstance(offers, list) else 0
 
 
 def set_scriptable_status_start(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -514,6 +618,12 @@ def set_scriptable_status_finish(
     return state
 
 
+def verify_written_file(path: str) -> None:
+    check = github_get_file(path)
+    if not check["ok"] or not check["exists"]:
+        raise RuntimeError(f"arquivo não confirmado após gravação: {path}")
+
+
 def main() -> int:
     if not GITHUB_TOKEN:
         log("erro: GITHUB_TOKEN ausente")
@@ -527,7 +637,12 @@ def main() -> int:
     status = load_status_runtime()
     seen_cache = load_seen_cache()
     seen_links = seen_cache.get("seen", [])
-    history_ids = load_history_ids()
+
+    history_data = load_history_data()
+    history_ids, history_dedupe = extract_history_sets(history_data)
+
+    pending_data = load_pending_data()
+    pending_ids, pending_dedupe = extract_pending_sets(pending_data)
 
     status = set_scriptable_status_start(status)
     save_status_runtime(status)
@@ -550,49 +665,52 @@ def main() -> int:
             return 1
 
         all_offers = extract_offer_cards(html, 60)
+
+        # filtro oficial: histórico + pending por id/link
+        id_candidates: List[Dict[str, Any]] = []
+        for offer in all_offers:
+            offer_key = normalize_offer_key(offer.get("id") or offer.get("link"))
+            if not offer_key:
+                continue
+            if offer_key in history_ids or offer_key in pending_ids:
+                continue
+            id_candidates.append(offer)
+
+        # apoio secundário: ordena priorizando links ainda não vistos pelo seen cache
         seen_set = set(seen_links)
-        detail_candidates = [o for o in all_offers if normalize_link(o["link"]) not in seen_set]
-        real_new_offers = [o for o in all_offers if o.get("id", "").strip().lower() not in history_ids]
-        num_real_new_offers = len(real_new_offers)
-        offers_to_test = detail_candidates[:MAX_DETAIL_FETCHES]
-
-        meta = {
-            "snapshot_id": snapshot_id,
-            "created_at": now_iso(),
-            "source_url": LIST_URL,
-            "html_path": html_path,
-            "html_length": len(html),
-            "total_offers_found": len(all_offers),
-            "detail_candidate_count": len(detail_candidates),
-            "total_new_offers_found": num_real_new_offers,
-            "tested_detail_count": len(offers_to_test),
-            "cache_size_before": len(seen_links),
-            "history_size": len(history_ids),
-            "context": "railway",
-        }
-
-        put_html = github_put_file(html_path, html, f"railway snapshot html {snapshot_id}")
-        if not put_html["ok"]:
-            raise RuntimeError(put_html["error"])
-
-        put_meta = github_put_file(
-            meta_path,
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            f"railway snapshot meta {snapshot_id}",
+        prioritized_candidates = sorted(
+            id_candidates,
+            key=lambda o: normalize_link(o["link"]) in seen_set,
         )
-        if not put_meta["ok"]:
-            raise RuntimeError(put_meta["error"])
 
         detail_results = []
+        selected_links_for_seen: List[str] = []
+        real_new_count = 0
+        tested_count = 0
         ok_count = 0
 
-        for i, offer in enumerate(offers_to_test, start=1):
+        for offer in prioritized_candidates:
+            if real_new_count >= MAX_DETAIL_FETCHES:
+                break
+
+            tested_count += 1
             detail = fetch_offer_detail_data(offer)
+
+            final_title = detail.get("title") or offer["title"]
+            final_validity = detail.get("validity") or ""
+            final_description = detail.get("description") or ""
+            dedupe_key = build_dedupe_key(final_title, final_validity, final_description)
+
+            if dedupe_key and (dedupe_key in history_dedupe or dedupe_key in pending_dedupe):
+                log(f"pulada por dedupe oficial: {final_title}")
+                continue
+
             if detail["ok"]:
                 ok_count += 1
+
             detail_results.append(
                 {
-                    "index": i,
+                    "index": real_new_count + 1,
                     "id": offer.get("id", ""),
                     "link": offer["link"],
                     "card_title": offer["title"],
@@ -609,18 +727,52 @@ def main() -> int:
                     "description_preview": (detail.get("description", "") or "")[:500],
                     "has_description": bool(detail.get("description")),
                     "detail_img_url": detail.get("detail_img_url", ""),
+                    "dedupe_key": dedupe_key,
                     "error": detail.get("error", ""),
                 }
             )
 
+            selected_links_for_seen.append(normalize_link(offer["link"]))
+            real_new_count += 1
+
+        meta = {
+            "snapshot_id": snapshot_id,
+            "created_at": now_iso(),
+            "source_url": LIST_URL,
+            "html_path": html_path,
+            "html_length": len(html),
+            "total_offers_found": len(all_offers),
+            "detail_candidate_count": len(id_candidates),
+            "total_new_offers_found": real_new_count,
+            "tested_detail_count": tested_count,
+            "cache_size_before": len(seen_links),
+            "history_size": len(history_ids),
+            "pending_size": len(pending_ids),
+            "context": "railway",
+        }
+
+        put_html = github_put_file(html_path, html, f"railway snapshot html {snapshot_id}")
+        if not put_html["ok"]:
+            raise RuntimeError(put_html["error"])
+        verify_written_file(html_path)
+
+        put_meta = github_put_file(
+            meta_path,
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            f"railway snapshot meta {snapshot_id}",
+        )
+        if not put_meta["ok"]:
+            raise RuntimeError(put_meta["error"])
+        verify_written_file(meta_path)
+
         detail_meta = {
             "snapshot_id": snapshot_id,
             "tested_at": now_iso(),
-            "tested_count": len(offers_to_test),
+            "tested_count": tested_count,
             "detail_ok_count": ok_count,
-            "detail_fail_count": len(offers_to_test) - ok_count,
+            "detail_fail_count": tested_count - ok_count,
             "cache_size_before": len(seen_links),
-            "cache_size_after": len(seen_links) + len(offers_to_test),
+            "cache_size_after": len(seen_links) + len(selected_links_for_seen),
             "offers": detail_results,
         }
 
@@ -631,8 +783,9 @@ def main() -> int:
         )
         if not put_detail["ok"]:
             raise RuntimeError(put_detail["error"])
+        verify_written_file(detail_meta_path)
 
-        merged_seen = seen_links + [normalize_link(o["link"]) for o in offers_to_test]
+        merged_seen = seen_links + selected_links_for_seen
         save_seen = save_seen_cache(merged_seen)
         if not save_seen["ok"]:
             raise RuntimeError(save_seen["error"])
@@ -641,15 +794,18 @@ def main() -> int:
         status = set_scriptable_status_finish(
             status,
             "ok",
-            f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | detalhes {ok_count}/{len(offers_to_test)}",
+            f"railway coleta ok: {snapshot_id} | vitrine {len(all_offers)} | novas reais {real_new_count} | detalhes {ok_count}/{tested_count}",
             len(all_offers),
-            num_real_new_offers,
+            real_new_count,
             current_pending,
             "",
         )
         save_status_runtime(status)
 
-        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{num_real_new_offers},{len(offers_to_test)},{ok_count},false,""'
+        csv_line = (
+            f'{now_iso()},true,200,{len(html)},{len(all_offers)},'
+            f"{real_new_count},{tested_count},{ok_count},false,\"\""
+        )
         log(csv_line)
         return 0
 
