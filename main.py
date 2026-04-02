@@ -5,7 +5,7 @@ import random
 import re
 import string
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import certifi
 import requests
@@ -24,6 +24,8 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 
 STATUS_RUNTIME_FILE = "status_runtime.json"
 SEEN_CACHE_FILE = "railway_seen_links.json"
+HISTORY_FILE = "historico_leouol.json"
+PENDING_FILE = "pending_offers.json"
 
 MAX_DETAIL_FETCHES = int(os.environ.get("MAX_DETAIL_FETCHES", "4"))
 MAX_SEEN_LINKS = int(os.environ.get("MAX_SEEN_LINKS", "300"))
@@ -34,14 +36,18 @@ USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
+
 def log(msg: str) -> None:
     print(msg, flush=True)
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+
 def github_api_url(path: str) -> str:
     return f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
+
 
 def build_headers_json() -> Dict[str, str]:
     return {
@@ -51,14 +57,17 @@ def build_headers_json() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+
 def base64_encode(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
 
 def base64_decode(text: str) -> Optional[str]:
     try:
         return base64.b64decode(str(text).replace("\n", "")).decode("utf-8")
     except Exception:
         return None
+
 
 def github_get_file(path: str) -> Dict[str, Any]:
     try:
@@ -72,6 +81,7 @@ def github_get_file(path: str) -> Dict[str, Any]:
         return {"ok": True, "exists": True, "content": raw, "sha": data.get("sha")}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 def github_put_file(path: str, content: str, message: str) -> Dict[str, Any]:
     current = github_get_file(path)
@@ -91,6 +101,7 @@ def github_put_file(path: str, content: str, message: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 def clean_text(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -107,6 +118,7 @@ def clean_text(text: Optional[str]) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
+
 def html_to_text(html: str) -> str:
     if not html:
         return ""
@@ -121,6 +133,7 @@ def html_to_text(html: str) -> str:
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
 
+
 def absolutize_url(url: Optional[str]) -> str:
     if not url:
         return ""
@@ -133,16 +146,45 @@ def absolutize_url(url: Optional[str]) -> str:
         return BASE_URL + url
     return f"{BASE_URL}/{url}"
 
+
 def normalize_link(url: str) -> str:
     return str(url or "").strip()
 
+
+def slugify_text(value: str) -> str:
+    value = clean_text(value).lower()
+    replacements = {
+        "á": "a", "à": "a", "â": "a", "ã": "a", "ä": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "í": "i", "ì": "i", "î": "i", "ï": "i",
+        "ó": "o", "ò": "o", "ô": "o", "õ": "o", "ö": "o",
+        "ú": "u", "ù": "u", "û": "u", "ü": "u",
+        "ç": "c",
+    }
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-")
+
+
+def build_offer_id_from_link(link: str, fallback_title: str = "") -> str:
+    link = normalize_link(link)
+    m = re.search(r"/([^/?#]+)$", link)
+    if m:
+        return m.group(1).strip().lower()
+    return slugify_text(fallback_title or link)
+
+
 def pad(n: int) -> str:
     return str(n).zfill(2)
+
 
 def build_snapshot_id() -> str:
     d = datetime.now()
     rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
     return f"{d.year}{pad(d.month)}{pad(d.day)}_{pad(d.hour)}{pad(d.minute)}{pad(d.second)}_{rand}"
+
 
 def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
     headers = {
@@ -161,6 +203,7 @@ def fetch_text(url: str, referer: str = BASE_URL + "/") -> str:
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False, allow_redirects=True)
         resp.raise_for_status()
         return resp.text
+
 
 def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
     cards = []
@@ -184,11 +227,13 @@ def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
             partner_alt = clean_text(partner_match.group(2)) if partner_match else ""
             partner_title = clean_text(partner_match.group(3)) if partner_match else ""
             benefit_img = absolutize_url(benefit_img_match.group(1)) if benefit_img_match else ""
+            offer_id = build_offer_id_from_link(link, title)
 
             if not link or not title:
                 continue
 
             cards.append({
+                "id": offer_id,
                 "link": link,
                 "title": title,
                 "category": category,
@@ -201,6 +246,7 @@ def extract_offer_cards(html: str, limit: int = 60) -> List[Dict[str, Any]]:
 
     return cards
 
+
 def extract_title_from_detail(html: str) -> str:
     for regex in [re.compile(r"<h2[^>]*>([\s\S]*?)</h2>", re.I), re.compile(r"<h1[^>]*>([\s\S]*?)</h1>", re.I)]:
         m = regex.search(html)
@@ -209,6 +255,7 @@ def extract_title_from_detail(html: str) -> str:
             if title:
                 return title
     return ""
+
 
 def extract_validity_from_detail(html: str) -> str:
     regexes = [
@@ -221,6 +268,7 @@ def extract_validity_from_detail(html: str) -> str:
         if m:
             return clean_text(m.group(0))
     return ""
+
 
 def extract_description_from_detail(html: str) -> str:
     regexes = [
@@ -235,6 +283,7 @@ def extract_description_from_detail(html: str) -> str:
                 return txt[:4000]
     return ""
 
+
 def extract_detail_image_from_detail(html: str) -> str:
     matches = re.finditer(r'<img[^>]+(?:data-src|data-original|data-lazy|src)="([^"]+)"', html, re.I)
     for m in matches:
@@ -242,6 +291,7 @@ def extract_detail_image_from_detail(html: str) -> str:
         if "/beneficios/" in src or "/campanhasdeingresso/" in src:
             return src
     return ""
+
 
 def fetch_offer_detail_data(offer: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -287,6 +337,7 @@ def fetch_offer_detail_data(offer: Dict[str, Any]) -> Dict[str, Any]:
             "error": str(e),
         }
 
+
 def load_seen_cache() -> Dict[str, Any]:
     result = github_get_file(SEEN_CACHE_FILE)
     if not result["ok"]:
@@ -300,6 +351,7 @@ def load_seen_cache() -> Dict[str, Any]:
     except Exception as e:
         return {"seen": [], "updated_at": "", "error": str(e)}
 
+
 def save_seen_cache(seen_links: List[str]) -> Dict[str, Any]:
     unique = []
     seen_set = set()
@@ -312,6 +364,7 @@ def save_seen_cache(seen_links: List[str]) -> Dict[str, Any]:
     payload = {"seen": unique[-MAX_SEEN_LINKS:], "updated_at": now_iso()}
     return github_put_file(SEEN_CACHE_FILE, json.dumps(payload, indent=2, ensure_ascii=False), f"update railway seen links {now_iso()}")
 
+
 def load_status_runtime() -> Dict[str, Any]:
     result = github_get_file(STATUS_RUNTIME_FILE)
     if not result["ok"] or not result["exists"] or not result["content"]:
@@ -321,10 +374,37 @@ def load_status_runtime() -> Dict[str, Any]:
     except Exception:
         return {"scriptable": {"last_started_at": "", "last_finished_at": "", "status": "", "summary": "", "offers_seen": 0, "new_offers": 0, "pending_count": 0, "last_error": ""}}
 
+
 def save_status_runtime(state: Dict[str, Any]) -> Dict[str, Any]:
     return github_put_file(STATUS_RUNTIME_FILE, json.dumps(state, indent=2, ensure_ascii=False), f"update status runtime by railway {now_iso()}")
 
-def set_scriptable_status_start(state: Dict[str, Any], cache_size: int) -> Dict[str, Any]:
+
+def load_history_ids() -> Set[str]:
+    result = github_get_file(HISTORY_FILE)
+    if not result["ok"] or not result["exists"] or not result["content"]:
+        return set()
+    try:
+        data = json.loads(result["content"])
+        ids = data.get("ids", [])
+        return {str(x).strip().lower() for x in ids if str(x).strip()}
+    except Exception:
+        return set()
+
+
+def load_pending_count() -> int:
+    result = github_get_file(PENDING_FILE)
+    if not result["ok"] or not result["exists"] or not result["content"]:
+        return 0
+    try:
+        data = json.loads(result["content"])
+        offers = data.get("offers", [])
+        return len(offers) if isinstance(offers, list) else 0
+    except Exception:
+        return 0
+
+
+def set_scriptable_status_start(state: Dict[str, Any]) -> Dict[str, Any]:
+    current_pending = load_pending_count()
     state["scriptable"] = {
         "last_started_at": now_iso(),
         "last_finished_at": state.get("scriptable", {}).get("last_finished_at", ""),
@@ -332,10 +412,11 @@ def set_scriptable_status_start(state: Dict[str, Any], cache_size: int) -> Dict[
         "summary": "railway collector iniciado",
         "offers_seen": 0,
         "new_offers": 0,
-        "pending_count": cache_size,
+        "pending_count": current_pending,
         "last_error": "",
     }
     return state
+
 
 def set_scriptable_status_finish(state: Dict[str, Any], status_value: str, summary: str, offers_seen: int, new_offers: int, pending_count: int, last_error: str = "") -> Dict[str, Any]:
     state["scriptable"] = {
@@ -350,6 +431,7 @@ def set_scriptable_status_finish(state: Dict[str, Any], status_value: str, summa
     }
     return state
 
+
 def main() -> int:
     if not GITHUB_TOKEN:
         log("erro: GITHUB_TOKEN ausente")
@@ -363,22 +445,25 @@ def main() -> int:
     status = load_status_runtime()
     seen_cache = load_seen_cache()
     seen_links = seen_cache.get("seen", [])
+    history_ids = load_history_ids()
 
-    status = set_scriptable_status_start(status, len(seen_links))
+    status = set_scriptable_status_start(status)
     save_status_runtime(status)
 
     try:
         html = fetch_text(LIST_URL, BASE_URL + "/")
         if not html or len(html.strip()) < 1000:
-            status = set_scriptable_status_finish(status, "erro", "html vazia ou curta demais", 0, 0, len(seen_links), "html vazia")
+            current_pending = load_pending_count()
+            status = set_scriptable_status_finish(status, "erro", "html vazia ou curta demais", 0, 0, current_pending, "html vazia")
             save_status_runtime(status)
             log("erro: html vazia ou curta demais")
             return 1
 
         all_offers = extract_offer_cards(html, 60)
         seen_set = set(seen_links)
-        new_offers = [o for o in all_offers if normalize_link(o["link"]) not in seen_set]
-        offers_to_test = new_offers[:MAX_DETAIL_FETCHES]
+        detail_candidates = [o for o in all_offers if normalize_link(o["link"]) not in seen_set]
+        real_new_offers = [o for o in all_offers if o.get("id", "").strip().lower() not in history_ids]
+        offers_to_test = detail_candidates[:MAX_DETAIL_FETCHES]
 
         meta = {
             "snapshot_id": snapshot_id,
@@ -387,9 +472,11 @@ def main() -> int:
             "html_path": html_path,
             "html_length": len(html),
             "total_offers_found": len(all_offers),
-            "total_new_offers_found": len(new_offers),
+            "detail_candidate_count": len(detail_candidates),
+            "total_new_offers_found": len(real_new_offers),
             "tested_detail_count": len(offers_to_test),
             "cache_size_before": len(seen_links),
+            "history_size": len(history_ids),
             "context": "railway",
         }
 
@@ -410,6 +497,7 @@ def main() -> int:
                 ok_count += 1
             detail_results.append({
                 "index": i,
+                "id": offer.get("id", ""),
                 "link": offer["link"],
                 "card_title": offer["title"],
                 "category": offer["category"],
@@ -448,27 +536,30 @@ def main() -> int:
         if not save_seen["ok"]:
             raise RuntimeError(save_seen["error"])
 
+        current_pending = load_pending_count()
         status = set_scriptable_status_finish(
             status,
             "ok",
             f"railway snapshots ok: {snapshot_id} | detalhes {ok_count}/{len(offers_to_test)}",
             len(all_offers),
-            len(new_offers),
-            min(len(set(merged_seen)), MAX_SEEN_LINKS),
+            len(real_new_offers),
+            current_pending,
             "",
         )
         save_status_runtime(status)
 
-        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{len(new_offers)},{len(offers_to_test)},{ok_count},false,""'
+        csv_line = f'{now_iso()},true,200,{len(html)},{len(all_offers)},{len(real_new_offers)},{len(offers_to_test)},{ok_count},false,""'
         log(csv_line)
         return 0
 
     except Exception as e:
-        status = set_scriptable_status_finish(status, "erro", "erro geral no railway collector", 0, 0, len(seen_links), str(e))
+        current_pending = load_pending_count()
+        status = set_scriptable_status_finish(status, "erro", "erro geral no railway collector", 0, 0, current_pending, str(e))
         save_status_runtime(status)
         safe_error = str(e).replace('"', "'")
         log(f'{now_iso()},false,0,0,0,0,0,0,false,"{safe_error}"')
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
